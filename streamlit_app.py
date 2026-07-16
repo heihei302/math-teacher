@@ -5,17 +5,17 @@ import json
 import cv2
 import numpy as np
 import re
-from PIL import Image
+from PIL import Image, ImageDraw
 from io import BytesIO
 from datetime import datetime
 import sqlite3
 import pandas as pd
 
 # ──────────────────────────────────────
-# 百度OCR配置：请把下面的 xxxx 替换成你的真实密钥
+# ‼️ 百度OCR密钥：请替换成你自己的真实值
 # ──────────────────────────────────────
-BAIDU_API_KEY = "bZTSq24Cgos2yPqJl5dGHaMg"          # 改这里
-BAIDU_SECRET_KEY = "eUOIIFCEV76xljrk8EKU9pS5F5jOueYD"    # 改这里
+BAIDU_API_KEY = "bZTSq24Cgos2yPqJl5dGHaMg"
+BAIDU_SECRET_KEY = "eUOIIFCEV76xljrk8EKU9pS5F5jOueYD"
 
 def get_baidu_token():
     url = "https://aip.baidubce.com/oauth/2.0/token"
@@ -26,26 +26,29 @@ def get_baidu_token():
     }
     return requests.post(url, params=params).json().get("access_token")
 
-def baidu_ocr_general(image_bytes):
-    """通用文字识别（纯文本题用）"""
+def baidu_ocr_general(image_bytes, location=False):
+    """通用文字识别（可返回坐标）"""
     token = get_baidu_token()
     url = f"https://aip.baidubce.com/rest/2.0/ocr/v1/general_basic?access_token={token}"
-    img_base64 = base64.b64encode(image_bytes).decode()
-    r = requests.post(url, data={"image": img_base64},
+    params = {"image": base64.b64encode(image_bytes).decode()}
+    if location:
+        url += "&location=true"   # 请求坐标
+        url += "&detect_direction=true"  # 自动检测方向
+    r = requests.post(url, data=params,
                       headers={"Content-Type": "application/x-www-form-urlencoded"})
     return r.json()
 
 def baidu_ocr_formula(image_bytes):
-    """数学公式识别（使用‘网络图片文字识别’里的公式模式）"""
+    """数学公式识别"""
     token = get_baidu_token()
     url = f"https://aip.baidubce.com/rest/2.0/ocr/v1/formula?access_token={token}"
-    img_base64 = base64.b64encode(image_bytes).decode()
-    r = requests.post(url, data={"image": img_base64},
+    params = {"image": base64.b64encode(image_bytes).decode()}
+    r = requests.post(url, data=params,
                       headers={"Content-Type": "application/x-www-form-urlencoded"})
     return r.json()
 
 # ──────────────────────────────────────
-# 数据库初始化（SQLite，自动创建）
+# 数据库初始化
 # ──────────────────────────────────────
 conn = sqlite3.connect("mistakes.db", check_same_thread=False)
 c = conn.cursor()
@@ -58,7 +61,7 @@ c.execute('''CREATE TABLE IF NOT EXISTS mistakes
 conn.commit()
 
 # ──────────────────────────────────────
-# 知识点分类规则（可自行扩充）
+# 知识点分类规则（你可以自由增删）
 # ──────────────────────────────────────
 def classify_knowledge(text):
     text = text.lower()
@@ -81,24 +84,125 @@ def classify_knowledge(text):
     return '其他知识点'
 
 # ──────────────────────────────────────
-# 题目电子化核心函数：用百度OCR识别文字和公式
+# 🔧 核心升级：精准分割题目
 # ──────────────────────────────────────
-def digitize_question(img_pil):
-    """将一道题的图片转成电子文本（文字+LaTeX公式）"""
+def split_questions(img_pil):
+    """
+    把试卷图片按题号切成单道题目的图像列表
+    返回：[(题目图片, 题目文本), ...]
+    """
+    img_cv = np.array(img_pil)
+    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
     img_bytes = BytesIO()
     img_pil.save(img_bytes, format='PNG')
     img_data = img_bytes.getvalue()
 
-    # 先用通用OCR获取文字
-    res = baidu_ocr_general(img_data)
+    # 1. 获取所有文字块及坐标
+    res = baidu_ocr_general(img_data, location=True)
+    words_info = res.get("words_result", [])
+    if not words_info:
+        return [(img_pil, "")]   # 如果识别不到，返回整张图
+
+    # 2. 按行整理（将同一水平线上的词合并成一行）
+    lines = []   # 每条记录：平均y, 所有词的信息列表
+    for w in words_info:
+        text = w.get("words", "")
+        loc = w.get("location", {})
+        if not loc:
+            continue
+        # 计算四个顶点的平均y坐标
+        ys = [loc['top'], loc['top']+loc['height'], loc['top']+loc['height'], loc['top']]
+        # location 可能格式是 left, top, width, height
+        if 'left' in loc and 'top' in loc and 'width' in loc and 'height' in loc:
+            left = loc['left']
+            top = loc['top']
+            width = loc['width']
+            height = loc['height']
+            avg_y = top + height/2
+        else:
+            # 旧格式：四个顶点
+            pts = loc  # 类似 {'x':...,'y':...} 四个点，但 general_basic 返回的是 left,top,width,height
+            # 为了兼容，以防万一使用中点
+            avg_y = sum([p.get('y', 0) for p in pts])/4 if isinstance(pts, list) else 0
+        lines.append((avg_y, left, top, width, height, text))
+
+    # 按照y坐标排序（从上到下）
+    lines.sort(key=lambda x: x[0])
+
+    # 合并同一行（y坐标差小于15个像素的视为一行）
+    merged_rows = []
+    current_row = []
+    current_y = None
+    threshold = 15
+    for item in lines:
+        y = item[0]
+        if current_y is None or abs(y - current_y) < threshold:
+            current_row.append(item)
+            current_y = y
+        else:
+            merged_rows.append((current_y, current_row))
+            current_row = [item]
+            current_y = y
+    if current_row:
+        merged_rows.append((current_y, current_row))
+
+    # 3. 找题号行
+    question_starts = []
+    for idx, (row_y, row_items) in enumerate(merged_rows):
+        # 将该行所有文本拼在一起
+        row_text = " ".join([it[5] for it in row_items])
+        # 检测题号：数字后跟 . 或 、（比如 "1." "2." "5、"）
+        if re.match(r'^\s*(\d+)[\.\、]', row_text.strip()):
+            question_starts.append(idx)
+
+    if not question_starts:
+        return [(img_pil, "")]   # 找不到题号，返回整张图
+
+    # 4. 根据题号行切出题目区域
+    questions = []
+    h, w = img_pil.height, img_pil.width
+    for i, start_idx in enumerate(question_starts):
+        # 确定本题区域：从本题号行y_min到下一题号行y_min（或图像底边）
+        start_y = int(merged_rows[start_idx][0] - 10)  # 向上留点边距
+        if i + 1 < len(question_starts):
+            next_idx = question_starts[i+1]
+            next_y = int(merged_rows[next_idx][0] - 10)
+            end_y = next_y
+        else:
+            end_y = h
+
+        # 考虑左右边界（稍微扩展）
+        x1 = 0
+        x2 = w
+        # 裁剪并保存为图片
+        crop_img = img_pil.crop((x1, max(0, start_y), x2, min(h, end_y)))
+        # 对该裁剪区域进行OCR，提取文本（使用通用OCR即可）
+        crop_bytes = BytesIO()
+        crop_img.save(crop_bytes, format='PNG')
+        crop_data = crop_bytes.getvalue()
+        ocr_res = baidu_ocr_general(crop_data, location=False)
+        crop_text = " ".join([w['words'] for w in ocr_res.get("words_result", [])])
+        questions.append((crop_img, crop_text.strip()))
+
+    return questions
+
+# ──────────────────────────────────────
+# 题目电子化（文字+公式）
+# ──────────────────────────────────────
+def digitize_question(img_pil):
+    img_bytes = BytesIO()
+    img_pil.save(img_bytes, format='PNG')
+    img_data = img_bytes.getvalue()
+
+    # 文字OCR
+    res = baidu_ocr_general(img_data, location=False)
     words = res.get("words_result", [])
     text_lines = [w['words'] for w in words]
-    # 再用公式OCR检测可能存在的公式
+    # 公式OCR
     formula_res = baidu_ocr_formula(img_data)
     formulas = formula_res.get("words_result", [])
-    formula_lines = [f['words'] for f in formulas]  # 返回的是 LaTeX 格式
+    formula_lines = [f['words'] for f in formulas]
 
-    # 简单合并：把公式按位置插入（这里为了演示，只把公式附加到文本后）
     combined = ""
     if text_lines:
         combined += "题目：" + " ".join(text_lines)
@@ -107,9 +211,10 @@ def digitize_question(img_pil):
     return combined.strip()
 
 # ──────────────────────────────────────
-# 红色笔迹错题检测（OpenCV）
+# 红色笔迹检测
 # ──────────────────────────────────────
 def detect_red_marks(image_cv):
+    """返回红色区域的矩形列表"""
     hsv = cv2.cvtColor(image_cv, cv2.COLOR_BGR2HSV)
     lower_red1 = np.array([0, 50, 50])
     upper_red1 = np.array([10, 255, 255])
@@ -121,36 +226,14 @@ def detect_red_marks(image_cv):
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return [cv2.boundingRect(c) for c in contours if cv2.contourArea(c) > 100]
-
-def is_question_wrong(question_pil, red_rects):
-    """把题目图片与全图红色区域比对"""
-    # 这里简化：如果题目区域与红色矩形有重叠就算错
-    # 实际需要坐标匹配，但Streamlit处理上传图片时没有统一坐标，所以我们用另一个方法：
-    # 直接在整个图片上判断，每个题目我们会先切割出来，再调用此函数。
-    # 更稳健的方案：直接对整张卷子做切割，然后逐一判断。
-    # 为了演示清晰，我们只针对整张卷子使用，返回整个卷子是否有红色标记。
-    return len(red_rects) > 0
-
-# 题目切割（基于题号识别，使用简单规则）
-def split_questions(img_pil):
-    """将试卷分割为单个题目图片"""
-    img_cv = np.array(img_pil)
-    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
-    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-    # 二值化
-    _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV)
-    # 找水平投影，分割行
-    # 这里简化：用百度OCR的段落检测结果进行切割
-    # 因为自己写切割鲁棒性不够，我们改用百度OCR的段落信息（需要升级API）
-    # 返回一个列表，每个元素是一道题的图片区域
-    # 注：百度高精度OCR可以返回段落坐标，但免费版只返回文字，无坐标。
-    # 作为演示，我们提供一个手动方法：用户手动框选错题区域，或提供更完整的坐标识别。
-    # 为了能让程序跑通，我们采用整张试卷电子化，不分割。
-    return [img_pil]  # 返回整张图
+    rects = []
+    for cont in contours:
+        if cv2.contourArea(cont) > 100:   # 过滤小噪点
+            rects.append(cv2.boundingRect(cont))
+    return rects
 
 # ──────────────────────────────────────
-# 家长反馈生成模板（成熟稳重教师口吻）
+# 家长反馈模板
 # ──────────────────────────────────────
 def parent_feedback(student_name, mistake_list):
     if not mistake_list:
@@ -169,7 +252,6 @@ def parent_feedback(student_name, mistake_list):
     lines.append("\n如有需要，我可以推荐针对性练习。我们一起帮助孩子稳步提升！")
     return "\n".join(lines)
 
-# ─── 班级反馈模板 ───
 def class_feedback(lesson_text, summary):
     return f"""📚【数学课堂反馈】
 本节课内容：{lesson_text}
@@ -181,12 +263,12 @@ def class_feedback(lesson_text, summary):
 让我们一起关注孩子的成长！"""
 
 # ──────────────────────────────────────
-# Streamlit 前端界面
+# 🖥 Streamlit 界面
 # ──────────────────────────────────────
-st.set_page_config(page_title="数学教学助手", layout="wide")
-st.title("👩‍🏫 初中数学教学智能助手")
+st.set_page_config(page_title="数学教学助手 Pro", layout="wide")
+st.title("👩‍🏫 初中数学教学智能助手（精准分割版）")
 
-# 侧边栏：学生错题集查询
+# 侧边栏：错题集
 with st.sidebar:
     st.subheader("📖 错题集查询")
     student_query = st.text_input("输入学生姓名查询错题")
@@ -202,49 +284,50 @@ with st.sidebar:
                 st.dataframe(df)
                 st.download_button("下载错题CSV", df.to_csv(index=False), file_name=f"{student_query}_错题集.csv")
 
-# 主功能区
 tab1, tab2, tab3 = st.tabs(["📝 学生试卷分析", "🏫 班级课堂反馈", "📚 题目电子化入库"])
 
-# ─────────────── 功能1：学生试卷分析 ───────────────
+# ───── 功能1：学生试卷分析（升级精准切割）─────
 with tab1:
-    st.subheader("上传学生试卷，自动识别错题并生成家长反馈")
+    st.subheader("上传学生试卷，逐题分析对错并生成家长反馈")
     student_name = st.text_input("学生姓名", key="sname")
     uploaded_files = st.file_uploader("选择试卷图片（可多选）", type=["png","jpg","jpeg"], accept_multiple_files=True)
     if uploaded_files and student_name:
         all_mistakes = []
         for file in uploaded_files:
             with st.spinner(f"正在分析 {file.name} …"):
-                # 读取图片
                 img_bytes = file.getvalue()
                 img_pil = Image.open(BytesIO(img_bytes))
-                # 检测红色标记（错题）
-                img_cv = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
-                red_rects = detect_red_marks(img_cv)
-                has_red = len(red_rects) > 0
-                # 电子化整张卷子（包括公式）
-                full_text = digitize_question(img_pil)
-                # 知识点分类
-                kp = classify_knowledge(full_text)
-                # 如果存在红色标记，视为错题（整张卷子有错就全收，简单处理）
-                if has_red:
-                    all_mistakes.append({
-                        "question": full_text,
-                        "knowledge": kp,
-                        "img": img_pil
-                    })
-                st.image(img_pil, caption=f"{file.name} 红色标记{len(red_rects)}处", width=300)
+                # 分割成题目列表
+                question_pieces = split_questions(img_pil)
+                st.write(f"📑 {file.name} 共检测到 {len(question_pieces)} 道题目")
+                # 对每道题单独处理
+                for q_idx, (q_img, q_text) in enumerate(question_pieces, start=1):
+                    # 转为cv2格式检测红色标记
+                    q_cv = cv2.cvtColor(np.array(q_img), cv2.COLOR_RGB2BGR)
+                    red_rects = detect_red_marks(q_cv)
+                    if len(red_rects) > 0:
+                        # 电子化完整题目（文字+公式）
+                        full_text = digitize_question(q_img)
+                        kp = classify_knowledge(full_text)
+                        all_mistakes.append({
+                            "question": full_text,
+                            "knowledge": kp,
+                            "img": q_img
+                        })
+                        st.image(q_img, caption=f"第{q_idx}题 ❌ 错题", width=250)
+                    else:
+                        st.image(q_img, caption=f"第{q_idx}题 ✓ 正确", width=250)
         # 保存错题到数据库
         for m in all_mistakes:
             c.execute("INSERT INTO mistakes (student, question, knowledge) VALUES (?,?,?)",
                       (student_name, m['question'], m['knowledge']))
             conn.commit()
-        st.success(f"分析完成！共收录 {len(all_mistakes)} 道错题。")
-        # 生成反馈
+        st.success(f"分析完成！收录 {len(all_mistakes)} 道错题。")
         if all_mistakes:
             feedback = parent_feedback(student_name, all_mistakes)
             st.text_area("📲 家长反馈（可直接复制）", feedback, height=200)
 
-# ─────────────── 功能2：班级课堂反馈 ───────────────
+# ───── 功能2：班级课堂反馈 ─────
 with tab2:
     st.subheader("生成本节课的班级群反馈")
     lesson_text = st.text_area("授课内容摘要（例如：一元一次方程的应用）")
@@ -261,7 +344,7 @@ with tab2:
         feedback = class_feedback(lesson_text, summary)
         st.text_area("📢 班级群文案", feedback, height=250)
 
-# ─────────────── 功能3：题目电子化入库 ───────────────
+# ───── 功能3：题目电子化入库 ─────
 with tab3:
     st.subheader("将任意题目照片转为电子文本并自动分类")
     q_file = st.file_uploader("上传题目图片（单题）", type=["png","jpg"])
@@ -281,4 +364,4 @@ with tab3:
                 conn.commit()
                 st.success("已保存！")
 
-st.caption("💡 提示：所有错题会自动记录，可在左侧查询。")
+st.caption("💡 提示：题库自动记录错题，左侧查询。试卷分析现已支持逐题精准切割。")
