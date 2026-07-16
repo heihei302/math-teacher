@@ -4,3 +4,4 @@ numpy
 Pillow
 pandas
 requests
+python-docx
