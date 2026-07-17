@@ -1,8 +1,6 @@
 streamlit
-google-generativeai
-opencv-python-headless
-numpy
+requests
 Pillow
 pandas
-requests
+numpy
 python-docx
