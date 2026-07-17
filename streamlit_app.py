@@ -1,33 +1,43 @@
 import streamlit as st
-import google.generativeai as genai
 import requests
 import base64
 import json
-import cv2
-import numpy as np
-from PIL import Image
+import re
 import io
 import pandas as pd
-import re
-from docx import Document
-from docx.shared import Pt, Inches
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import time
+from datetime import datetime
 import tempfile
 import os
-from typing import List, Dict
+from copy import deepcopy
 
-# ===== 配置：从 Streamlit Cloud 的 Secrets 中读取密钥 =====
+# ===== 全局配置 =====
+# 百度 OCR 密钥从 secrets 读取
 BAIDU_API_KEY = st.secrets["BAIDU_API_KEY"]
 BAIDU_SECRET_KEY = st.secrets["BAIDU_SECRET_KEY"]
+# Gemini API 密钥
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+# 如果配置了代理，则使用（如 http://127.0.0.1:7890）
+GEMINI_PROXY = st.secrets.get("GEMINI_PROXY", None)
 
-# 配置 Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-pro')  # 文本模型
+# Gemini API 基础 URL（直接调用）
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={GEMINI_API_KEY}"
 
-# ===== 百度 OCR 函数 =====
-def baidu_ocr(image_bytes):
-    """调用百度通用文字识别（高精度版）"""
-    url = "https://aip.baidubce.com/rest/2.0/ocr/v1/accurate_basic"
+# ===== 初始化 session_state（题库、学生记录） =====
+if "papers" not in st.session_state:
+    st.session_state.papers = []  # 每份试卷：{id, name, questions:[{num, content, correct}]}
+if "students" not in st.session_state:
+    st.session_state.students = {}  # 学生姓名 -> {wrong:[{paper_id, num, content}]}
+if "paper_counter" not in st.session_state:
+    st.session_state.paper_counter = 0
+
+# ===== 百度 OCR（含位置） =====
+def baidu_ocr_with_location(image_bytes):
+    """调用百度通用文字识别（含位置），返回每个文字块的坐标和文字"""
+    url = "https://aip.baidubce.com/rest/2.0/ocr/v1/general"
+    # 获取 access_token
     token_host = "https://aip.baidubce.com/oauth/2.0/token"
     token_params = {
         "grant_type": "client_credentials",
@@ -44,310 +54,341 @@ def baidu_ocr(image_bytes):
     response = requests.post(ocr_url, headers=headers, data=data)
     result = response.json()
 
-    words = []
+    words_info = []
     if "words_result" in result:
         for item in result["words_result"]:
-            words.append(item["words"])
-    return "\n".join(words)
+            words_info.append({
+                "text": item["words"],
+                "location": item["location"]  # {left, top, width, height}
+            })
+    return words_info
 
-# ===== Gemini 通用调用函数 =====
-def gemini_generate(prompt, fallback=""):
-    """调用 Gemini 生成文本，失败时返回备用内容"""
-    try:
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        st.warning(f"Gemini 调用失败：{e}，使用备用内容。")
-        return fallback
-
-# ===== 错题分析与知识点提取 =====
-def analyze_test_paper(ocr_text, class_level="八年级"):
-    """
-    让 Gemini 从 OCR 文字中提取题目、判断对错、分析知识点
-    返回: {
-        "questions": [ { "number": 1, "content": "...", "correct": true, "knowledge": "代数" } ],
-        "summary": "整体情况描述"
+# ===== 调用 Gemini（支持代理） =====
+def call_gemini(prompt):
+    """直接 HTTP 请求，可通过 GEMINI_PROXY 设置代理"""
+    proxies = None
+    if GEMINI_PROXY:
+        proxies = {"https": GEMINI_PROXY}
+    headers = {"Content-Type": "application/json"}
+    data = {
+        "contents": [{"parts": [{"text": prompt}]}]
     }
-    """
-    prompt = f"""你是一位经验丰富的{ class_level }数学老师。下面是从一张已经批改过的学生试卷上识别出的文字（可能包含老师打的对错标记 √ 或 × 以及得分）。
-请严格按照以下要求处理：
-
-1. 提取试卷中的所有题目，并为每道题给出：
-   - 题号（如果识别不出用 "未知"）
-   - 题目完整内容（包括学生的作答痕迹）
-   - 对错判断（根据识别到的 √ 或 ×，或根据得分标记推理，无法判断时标注为"未知"）
-   - 所属知识点（例如：一元一次方程、平面几何、因式分解等，用简洁的词组表示）
-
-2. 对整体情况给出100字左右的总结，包括：
-   - 完成较好的知识点
-   - 需要加强的知识点
-
-请以 JSON 数组格式返回，格式如下（不要包含其他文字）：
-{{
-  "questions": [
-    {{"number": "1", "content": "题目内容...", "correct": true, "knowledge": "代数"}},
-    ...
-  ],
-  "summary": "整体完成情况总结..."
-}}
-
-OCR 文字：
-{ocr_text}
-"""
-    result_text = gemini_generate(prompt, fallback='{"questions":[], "summary":"无法分析"}')
-    # 尝试解析 JSON
     try:
-        # 去掉可能的 markdown 代码块标记
-        cleaned = re.sub(r'```json|```', '', result_text).strip()
-        data = json.loads(cleaned)
-        return data
-    except:
-        st.error("Gemini 返回格式异常，请重试。")
-        return {"questions": [], "summary": "解析失败"}
-
-# ===== 家长反馈生成 =====
-def parent_feedback(wrong_questions, knowledge_stats, class_level):
-    """根据错题列表和知识点统计生成给家长的话"""
-    prompt = f"""你是一位成熟稳重的初中数学老师。请根据以下学生的错题情况，写一段可以直接发给家长的反馈（约120-180字）：
-要求：
-- 语气鼓励、亲切，先肯定优点，再指出需要加强的地方，并提供家庭辅导建议。
-- 使用称呼“家长您好”。
-- 提及具体的薄弱知识点。
-
-学生年级：{ class_level }
-错题涉及的知识点：{', '.join(knowledge_stats)}
-错题数量：{len(wrong_questions)}
-典型错题示例：{wrong_questions[0]['content'] if wrong_questions else '无'}
-"""
-    return gemini_generate(prompt, fallback="家长您好，孩子本次作业完成认真，部分题目需要加强练习，请查看错题集。")
-
-# ===== 班级课堂反馈生成 =====
-def class_feedback(lesson_content_text, test_summary, class_level):
-    """结合本节课内容和试卷整体情况生成班群反馈"""
-    prompt = f"""你是一位{ class_level }数学老师。请根据以下信息，生成一段可以发在班级群里的“课堂反馈”，内容需包含：
-1. 本节课授课内容概述（根据提供的图片/文字描述）
-2. 本节课的重难点
-3. 结合学生上次测试的整体情况，指出需要共同关注的问题
-
-要求语言简洁正式，方便家长了解，总字数200-300字。
-
-=== 本节课内容描述 ===
-{ lesson_content_text }
-
-=== 上次测试整体情况 ===
-{ test_summary }
-"""
-    return gemini_generate(prompt, fallback="今日课堂内容已总结，请查看孩子作业。")
-
-# ===== 题目提取与分类 =====
-def extract_questions_by_knowledge(ocr_text, class_level):
-    """让 Gemini 将识别出的文字整理成电子版题目，并按知识点分类"""
-    prompt = f"""你是一位{ class_level }数学老师。请从以下OCR识别出的试卷文字中，提取每一道完整的题目，并按照知识点进行分类。
-返回格式为 JSON，每个知识点下包含一个题目列表：
-{{
-  "知识点1": ["题目1完整内容", "题目2完整内容"],
-  "知识点2": ["题目3完整内容"]
-}}
-如果OCR文字不清晰，请根据数学常见题型合理补全题目。只返回JSON，不要多余文字。
-
-OCR 文字：
-{ocr_text}
-"""
-    result_text = gemini_generate(prompt, fallback='{"未分类":["无法提取题目"]}')
-    try:
-        cleaned = re.sub(r'```json|```', '', result_text).strip()
-        return json.loads(cleaned)
-    except:
-        st.error("题目分类解析失败，请稍后重试。")
-        return {"未分类": ["解析异常"]}
-
-# ===== 导出 Word 错题集 =====
-def export_wrong_questions_to_docx(wrong_questions, class_level):
-    """将错题列表导出为 Word 文档，返回文件路径"""
-    doc = Document()
-    doc.add_heading(f'{class_level} 错题集', 0)
-
-    for q in wrong_questions:
-        doc.add_paragraph(f"题号：{q.get('number', '未知')}", style='List Bullet')
-        doc.add_paragraph(f"题目：{q.get('content', '')}")
-        doc.add_paragraph(f"知识点：{q.get('knowledge', '未知')}")
-        doc.add_paragraph("")  # 空行
-
-    # 保存到临时文件
-    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
-    doc.save(tmp_file.name)
-    return tmp_file.name
-
-# ===== 页面初始化 =====
-if "wrong_questions_list" not in st.session_state:
-    st.session_state.wrong_questions_list = []   # 存储多张试卷的错题
-if "test_summary" not in st.session_state:
-    st.session_state.test_summary = ""           # 最近一次试卷的整体总结
-
-st.set_page_config(page_title="数学教学助手 Pro", layout="wide")
-st.title("📐 数学教学智能助手 Pro")
-st.markdown("支持错题检测、专属错题集、课堂反馈生成、题目电子化。")
-
-# ===== 功能选项卡 =====
-tab1, tab2, tab3, tab4 = st.tabs(["📝 试卷分析与错题集", "📢 班级课堂反馈", "📋 题目电子化", "❓ 使用说明"])
-
-# ==================== Tab1: 试卷分析与错题集 ====================
-with tab1:
-    st.header("上传已批改的试卷照片，自动识别错题并收录")
-    class_level = st.selectbox("选择年级", ["七年级", "八年级", "九年级"], key="tab1_level")
-    uploaded_files = st.file_uploader(
-        "支持批量上传（每次可多选）", type=["jpg", "jpeg", "png"], accept_multiple_files=True
-    )
-
-    if uploaded_files:
-        if st.button("🔍 开始分析试卷", type="primary"):
-            all_wrong = []
-            total_summaries = []
-            progress = st.progress(0)
-            for i, file in enumerate(uploaded_files):
-                image = Image.open(file)
-                st.image(image, caption=file.name, width=300)
-                with st.spinner(f"正在识别 {file.name} ..."):
-                    ocr_text = baidu_ocr(file.getvalue())
-                    if ocr_text:
-                        st.text_area(f"OCR 结果 - {file.name}", ocr_text, height=100)
-                        analysis = analyze_test_paper(ocr_text, class_level)
-                        if analysis:
-                            wrong_qs = [q for q in analysis["questions"] if not q.get("correct", True)]
-                            all_wrong.extend(wrong_qs)
-                            total_summaries.append(analysis.get("summary", ""))
-                            st.success(f"{file.name} 分析完成：错题 {len(wrong_qs)} 道")
-                        else:
-                            st.error(f"{file.name} 分析失败")
-                    else:
-                        st.warning(f"{file.name} 未识别到文字。")
-                progress.progress((i+1)/len(uploaded_files))
-
-            # 保存到 session_state
-            if all_wrong:
-                st.session_state.wrong_questions_list.extend(all_wrong)
-                # 去重（简单按内容去重）
-                seen = set()
-                unique_wrong = []
-                for q in st.session_state.wrong_questions_list:
-                    key = q.get("content", "")
-                    if key not in seen:
-                        seen.add(key)
-                        unique_wrong.append(q)
-                st.session_state.wrong_questions_list = unique_wrong
-                st.session_state.test_summary = "\n".join(total_summaries)
-                st.success(f"共收录错题 {len(st.session_state.wrong_questions_list)} 道（已自动去重）")
-            else:
-                st.info("未检测到错题，或请检查图片是否包含对错标记。")
-
-    # 显示已收录的错题
-    if st.session_state.wrong_questions_list:
-        st.subheader("📂 当前错题集")
-        df = pd.DataFrame(st.session_state.wrong_questions_list)
-        st.dataframe(df)
-
-        # 知识点统计
-        knowledge_counts = df['knowledge'].value_counts()
-        st.bar_chart(knowledge_counts)
-
-        # 生成家长反馈
-        if st.button("💬 生成家长反馈"):
-            with st.spinner("生成中..."):
-                fb = parent_feedback(
-                    st.session_state.wrong_questions_list,
-                    knowledge_counts.index.tolist(),
-                    class_level
-                )
-                st.text_area("家长反馈（可直接复制）", fb, height=200)
-
-        # 导出错题集
-        if st.button("⬇️ 导出错题集为 Word"):
-            path = export_wrong_questions_to_docx(st.session_state.wrong_questions_list, class_level)
-            with open(path, "rb") as f:
-                st.download_button(
-                    "下载错题集.docx",
-                    f,
-                    file_name="错题集.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                )
-            os.unlink(path)
-
-        # 清空错题集
-        if st.button("🗑️ 清空错题集"):
-            st.session_state.wrong_questions_list = []
-            st.session_state.test_summary = ""
-            st.rerun()
-
-# ==================== Tab2: 班级课堂反馈 ====================
-with tab2:
-    st.header("生成本节课的班级课堂反馈")
-    st.markdown("结合之前试卷分析的整体情况（从错题集摘要自动获取）和本节课内容。")
-    class_level_t2 = st.selectbox("年级", ["七年级", "八年级", "九年级"], key="tab2_level")
-
-    # 显示已有测试总结
-    if st.session_state.test_summary:
-        with st.expander("📊 已有测试整体情况（自动从试卷分析获取）"):
-            st.write(st.session_state.test_summary)
-    else:
-        st.info("请先在「试卷分析」Tab 中分析至少一张试卷，或手动输入测试整体情况。")
-
-    # 本节课内容输入
-    lesson_text = st.text_area("✏️ 输入本节课的文字描述（或补充说明）", height=100)
-    lesson_image = st.file_uploader("📷 上传本节课板书/课件照片（可选）", type=["jpg","jpeg","png"])
-
-    if st.button("📢 生成班级反馈", key="class_feedback_btn"):
-        # 处理本节课图片文字
-        extra_ocr = ""
-        if lesson_image:
-            with st.spinner("识别图片文字..."):
-                extra_ocr = baidu_ocr(lesson_image.getvalue())
-                st.text_area("图片识别结果", extra_ocr, height=80)
-        full_lesson_desc = lesson_text + "\n" + extra_ocr
-
-        test_summary = st.session_state.test_summary or "暂无测试数据"
-        feedback = class_feedback(full_lesson_desc, test_summary, class_level_t2)
-        st.text_area("课堂反馈（可复制到班群）", feedback, height=250)
-
-# ==================== Tab3: 题目电子化 ====================
-with tab3:
-    st.header("将试卷/习题照片转换为电子版，并按知识点分类")
-    class_level_t3 = st.selectbox("年级", ["七年级", "八年级", "九年级"], key="tab3_level")
-    source_file = st.file_uploader("上传包含题目的图片或 PDF（暂只支持图片）", type=["jpg","jpeg","png"])
-
-    if source_file and st.button("🔄 开始转换"):
-        with st.spinner("OCR 识别中..."):
-            ocr_text = baidu_ocr(source_file.getvalue())
-        if ocr_text:
-            st.text_area("OCR 文字", ocr_text, height=150)
-            with st.spinner("Gemini 正在提取题目并分类..."):
-                result_dict = extract_questions_by_knowledge(ocr_text, class_level_t3)
-            st.subheader("📚 按知识点分类的电子版题目")
-            for knowledge, qs in result_dict.items():
-                with st.expander(f"**{knowledge}** ({len(qs)} 题)"):
-                    for idx, q in enumerate(qs, 1):
-                        st.markdown(f"{idx}. {q}")
+        resp = requests.post(GEMINI_URL, headers=headers, json=data, proxies=proxies, timeout=30)
+        if resp.status_code == 200:
+            result = resp.json()
+            return result["candidates"][0]["content"]["parts"][0]["text"]
         else:
-            st.error("未识别到文字，请上传清晰的图片。")
+            st.error(f"Gemini 返回错误: {resp.status_code} {resp.text}")
+            return None
+    except Exception as e:
+        st.error(f"无法连接 Gemini: {e}")
+        return None
 
-# ==================== Tab4: 使用说明 ====================
-with tab4:
-    st.markdown("""
-    ### 功能说明
-    1. **试卷分析与错题集**  
-       上传已批改的试卷照片（支持批量），程序自动识别√/×标记，提取错题并分析知识点。  
-       错题会自动累积到“错题集”中，可导出 Word 文档，方便打印或存档。  
-       点击“生成家长反馈”可获得一段可直接发送给家长的话。
+# ===== 自动切题（基于题号） =====
+def auto_split_questions(ocr_words):
+    """
+    根据题号（如"1."、"2."）将文字块分组，返回题目列表
+    返回：[[text_block1, text_block2], ...]
+    """
+    # 把文字块按纵坐标排序（从上到下，从左到右）
+    sorted_words = sorted(ocr_words, key=lambda w: (w["location"]["top"], w["location"]["left"]))
+    
+    # 检测题号的正则
+    ptn = re.compile(r'^(\d{1,2})[\.、]')
+    questions = []
+    current_q = []
+    current_num = None
+    
+    for w in sorted_words:
+        text = w["text"].strip()
+        m = ptn.match(text)
+        if m:
+            # 开始新题目
+            if current_q and current_num is not None:
+                questions.append({"num": current_num, "blocks": current_q})
+            current_num = m.group(1)
+            current_q = [w]
+        else:
+            if current_q is not None:
+                current_q.append(w)
+            else:
+                # 开头没有题号的情况，作为第一题
+                current_num = "1"
+                current_q = [w]
+    # 最后一题
+    if current_q:
+        questions.append({"num": current_num, "blocks": current_q})
+    return questions
 
-    2. **班级课堂反馈**  
-       输入本节课的文字描述或上传板书照片，程序会结合之前的试卷整体情况，  
-       生成一段包含授课内容、重难点和学情分析的班群反馈。
+# ===== 绘制红色批改标记（在图像上画 √/○） =====
+def draw_grading_marks(image, questions):
+    """
+    传入 PIL Image 和题目列表（含 correct 字段），在原图上绘制对错符号
+    """
+    img = image.copy()
+    draw = ImageDraw.Draw(img)
+    # 尝试加载字体，如果没有就默认
+    try:
+        font = ImageFont.truetype("arial.ttf", 30)
+    except:
+        font = ImageFont.load_default()
+    
+    for q in questions:
+        if "location" in q:  # 需要有坐标信息
+            loc = q["location"]
+            x = loc["left"] + loc["width"] + 5
+            y = loc["top"]
+            if q.get("correct", True):
+                # 绿色 √
+                draw.text((x, y), "√", fill="red", font=font)
+            else:
+                # 红色 ○
+                draw.ellipse([x-10, y-5, x+10, y+15], outline="red", width=2)
+    return img
 
-    3. **题目电子化**  
-       上传试卷或习题照片，程序提取每一道题并按照知识点分组显示，  
-       方便您直接复制到课件或练习文档中。
+# ===== 保存试卷到题库 =====
+def save_paper(name, questions):
+    paper = {
+        "id": st.session_state.paper_counter,
+        "name": name,
+        "questions": questions  # [{num, content, correct}]
+    }
+    st.session_state.papers.append(paper)
+    st.session_state.paper_counter += 1
 
-    ### 注意事项
-    - 请确保试卷照片中已经包含老师的批改痕迹（√ / × 或得分），以便准确判断对错。
-    - 所有分析均依赖 Gemini 和百度 OCR，请确保网络畅通。
-    - 错题集会暂存在当前浏览器会话中，关闭页面后数据会丢失，请及时导出。
-    """)
+# ===== 页面布局 =====
+st.set_page_config(page_title="初中数学教学助手 Pro", layout="wide")
+st.title("📐 初中数学教学助手 Pro")
+st.markdown("—— 智能切题·错题追踪·个性化反馈 ——")
+
+tabs = st.tabs([
+    "📄 试卷管理与切题",
+    "👩‍🎓 学生错题管理",
+    "📊 全班课堂反馈",
+    "💾 数据导入/导出"
+])
+
+# ================= 试卷管理 =================
+with tabs[0]:
+    st.header("1. 上传试卷并切题")
+    uploaded_file = st.file_uploader("选择试卷图片（jpg/png）", type=["jpg","jpeg","png"])
+
+    if uploaded_file:
+        image = Image.open(uploaded_file)
+        img_bytes = uploaded_file.getvalue()
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("原始图片")
+            st.image(image, use_column_width=True)
+
+        # OCR 识别（含位置）
+        with st.spinner("正在识别文字与位置..."):
+            ocr_data = baidu_ocr_with_location(img_bytes)
+        
+        # 自动切题
+        raw_questions = auto_split_questions(ocr_data)
+        st.session_state.raw_questions = raw_questions
+        st.session_state.ocr_data = ocr_data
+
+        # 显示自动切题结果
+        st.subheader("自动切题结果（可手动调整）")
+        edited_questions = []
+        for idx, q in enumerate(raw_questions):
+            with st.expander(f"第 {q['num']} 题（{len(q['blocks'])}个文字块）"):
+                full_text = " ".join([b["text"] for b in q["blocks"]])
+                content = st.text_area(f"题目内容 （题号：{q['num']}）", full_text, key=f"q_text_{idx}")
+                correct = st.radio("对错", ["对", "错"], index=0, key=f"correct_{idx}") == "对"
+                edited_questions.append({
+                    "num": q["num"],
+                    "content": content,
+                    "correct": correct,
+                    "location": q["blocks"][0]["location"]  # 取第一个文字块位置用于绘图
+                })
+
+        # 手动添加/删除题目
+        st.markdown("---")
+        st.write("**手动补充题目**")
+        manual_num = st.text_input("题号", "")
+        manual_content = st.text_area("内容", "")
+        if st.button("添加此题目"):
+            edited_questions.append({
+                "num": manual_num,
+                "content": manual_content,
+                "correct": True,
+                "location": None
+            })
+            st.success("已添加")
+
+        # 保存试卷
+        paper_name = st.text_input("试卷名称（例如：2025年3月月考）", value=f"试卷_{datetime.now().strftime('%m%d_%H%M')}")
+        if st.button("💾 保存试卷到题库"):
+            # 过滤掉空题
+            valid_questions = [q for q in edited_questions if q["content"].strip()]
+            if not valid_questions:
+                st.warning("请至少保留一道有效题目")
+            else:
+                save_paper(paper_name, valid_questions)
+                st.success(f"试卷「{paper_name}」已保存！题库中有 {len(st.session_state.papers)} 份试卷。")
+                # 可选：在图片上绘制批改标记
+                if st.checkbox("在图片上显示红色批改标记"):
+                    marked_img = draw_grading_marks(image, valid_questions)
+                    st.image(marked_img, caption="批改效果预览", use_column_width=True)
+
+# ================= 学生错题管理 =================
+with tabs[1]:
+    st.header("2. 学生错题记录")
+    # 学生姓名管理
+    all_student_names = list(st.session_state.students.keys())
+    student_name = st.text_input("输入学生姓名", "")
+    if student_name and student_name not in st.session_state.students:
+        if st.button(f"新建学生「{student_name}」"):
+            st.session_state.students[student_name] = {"wrong": []}
+            st.success(f"已创建学生 {student_name} 的档案")
+    
+    selected_student = st.selectbox("选择已有学生", options=[""] + all_student_names, index=0)
+    student_name = student_name or selected_student  # 优先使用输入框
+
+    if student_name and student_name in st.session_state.students:
+        st.subheader(f"📋 {student_name} 的错题集")
+        # 显示已有错题
+        wrong_list = st.session_state.students[student_name]["wrong"]
+        if wrong_list:
+            df = pd.DataFrame(wrong_list)
+            st.dataframe(df)
+        else:
+            st.info("暂无错题记录")
+
+        # 从题库添加错题
+        st.markdown("---")
+        st.write("### 从已保存试卷中录入错题")
+        if st.session_state.papers:
+            paper_names = [p["name"] for p in st.session_state.papers]
+            chosen_paper_name = st.selectbox("选择试卷", paper_names)
+            chosen_paper = next(p for p in st.session_state.papers if p["name"] == chosen_paper_name)
+            
+            # 显示该试卷题目，让用户勾选错题
+            st.write(f"试卷「{chosen_paper_name}」共有 {len(chosen_paper['questions'])} 题，请勾选错题：")
+            selected_indices = []
+            for i, q in enumerate(chosen_paper["questions"]):
+                col1, col2 = st.columns([0.05, 0.95])
+                with col1:
+                    checked = st.checkbox("", key=f"sel_{chosen_paper['id']}_{i}")
+                with col2:
+                    st.write(f"**{q['num']}.** {q['content'][:100]}...")
+                if checked:
+                    selected_indices.append(i)
+            
+            if st.button("📥 保存至该生错题库"):
+                for idx in selected_indices:
+                    q = chosen_paper["questions"][idx]
+                    # 避免重复添加（简单判断相同的paper_id和num）
+                    existing = [e for e in wrong_list if e["paper_id"]==chosen_paper["id"] and e["num"]==q["num"]]
+                    if not existing:
+                        wrong_list.append({
+                            "paper_id": chosen_paper["id"],
+                            "paper_name": chosen_paper_name,
+                            "num": q["num"],
+                            "content": q["content"]
+                        })
+                st.session_state.students[student_name]["wrong"] = wrong_list
+                st.success(f"已添加 {len(selected_indices)} 道错题")
+        else:
+            st.warning("题库为空，请先上传并保存试卷")
+
+        # 生成个性化分析（调用Gemini）
+        if st.button("🔍 生成该生个性化错题分析报告"):
+            if wrong_list:
+                all_wrong_text = "\n".join([f"{w['num']}. {w['content']}" for w in wrong_list])
+                prompt = f"""你是一位初中数学老师。请根据以下学生的所有错题，写一份200字左右的个性化分析报告，包括：
+- 主要薄弱知识点
+- 建议的复习方向
+- 几句鼓励的话
+学生姓名：{student_name}
+错题列表：
+{all_wrong_text}
+"""
+                with st.spinner("Gemini 正在分析..."):
+                    report = call_gemini(prompt)
+                if report:
+                    st.text_area("分析报告", report, height=200)
+            else:
+                st.warning("请先录入错题")
+
+        # 下载错题集
+        if wrong_list and st.button("⬇️ 导出 Word 错题集"):
+            from docx import Document
+            doc = Document()
+            doc.add_heading(f"{student_name} 数学错题集", 0)
+            for w in wrong_list:
+                doc.add_paragraph(f"试卷：{w['paper_name']}  题号：{w['num']}")
+                doc.add_paragraph(w['content'])
+                doc.add_paragraph("")
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
+            doc.save(tmp.name)
+            with open(tmp.name, "rb") as f:
+                st.download_button("下载错题集.docx", f, file_name=f"{student_name}_错题集.docx")
+            os.unlink(tmp.name)
+
+# ================= 全班课堂反馈 =================
+with tabs[2]:
+    st.header("3. 生成全班课堂反馈")
+    st.write("上传本节课的板书/课件照片，或输入文字描述，Gemini 将生成可直接发班群的反馈（格式参考示例）")
+
+    lesson_img = st.file_uploader("📷 上传课堂照片/文件", type=["jpg","jpeg","png","pdf"], key="lesson_img")
+    lesson_text = st.text_area("✏️ 文字补充（可选）", height=100)
+
+    if st.button("📢 生成班级反馈"):
+        ocr_text = ""
+        if lesson_img:
+            with st.spinner("识别图片文字..."):
+                ocr_text = baidu_ocr_with_location(lesson_img.getvalue())
+                ocr_text = " ".join([w["text"] for w in ocr_text])
+        full_desc = lesson_text + "\n" + ocr_text
+
+        prompt = f"""你是一位初中数学老师。请根据以下课堂内容描述，生成一份班级课堂反馈，格式如下：
+一、 授课内容概览（概括本节课知识体系，分点列出）
+二、 学生练习常见易错点分析（列出3-4个典型错误，用通俗语言说明）
+要求200-300字，语气专业亲切。
+
+课堂内容素材：
+{full_desc}
+"""
+        with st.spinner("Gemini 写作中..."):
+            feedback = call_gemini(prompt)
+        if feedback:
+            st.text_area("课堂反馈（可复制到班群）", feedback, height=300)
+
+# ================= 数据导入/导出 =================
+with tabs[3]:
+    st.header("4. 题库与学生数据导入/导出")
+    st.markdown("为了保证数据不会丢失，请定期导出数据库为 JSON 文件，下次使用前导入即可。")
+
+    # 导出
+    if st.button("⬇️ 导出全部数据"):
+        export_data = {
+            "papers": st.session_state.papers,
+            "students": st.session_state.students,
+            "paper_counter": st.session_state.paper_counter
+        }
+        json_str = json.dumps(export_data, ensure_ascii=False, indent=2)
+        st.download_button(
+            "下载数据备份.json",
+            json_str,
+            file_name="教学助手数据.json",
+            mime="application/json"
+        )
+
+    # 导入
+    st.write("导入之前导出的 JSON 文件（会覆盖当前数据）")
+    uploaded_json = st.file_uploader("上传数据文件", type="json", key="json_upload")
+    if uploaded_json:
+        try:
+            imported = json.load(uploaded_json)
+            st.session_state.papers = imported.get("papers", [])
+            st.session_state.students = imported.get("students", {})
+            st.session_state.paper_counter = imported.get("paper_counter", 0)
+            st.success("数据导入成功！请刷新页面或切换到其他选项卡查看。")
+        except:
+            st.error("文件格式错误")
